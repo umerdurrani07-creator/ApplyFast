@@ -372,7 +372,7 @@ def analyze_with_openrouter(job_description, resume):
         "model": model,
         "max_tokens": env_int("OPENROUTER_MAX_TOKENS", 3000, 1000, 8000),
         "messages": [{"role": "user", "content": build_prompt(job_description, resume_context, retrieval_meta)}],
-        "reasoning": {"enabled": True},
+        "reasoning": {"enabled": False},
     }
     request = urllib.request.Request(
         "https://openrouter.ai/api/v1/chat/completions",
