@@ -391,14 +391,14 @@ window.addEventListener("DOMContentLoaded", () => {
             <textarea class="af-textarea" id="jd" placeholder="Include the role summary, responsibilities, and requirements — the more detail, the better your results…"></textarea>
           </div>
           <div>
-            <div class="field-label">Your resume <span>PDF, DOC, or TXT</span></div>
+            <div class="field-label">Your resume <span>PDF, DOCX, or TXT</span></div>
             <div class="drop" id="drop" onclick="document.getElementById('fInput').click()" tabindex="0" role="button" aria-label="Upload resume">
               <i class="ti ti-file-text drop-icon" aria-hidden="true"></i>
               <div class="drop-head">Click to upload</div>
               <div class="drop-sub">or drag and drop your file here</div>
               <div class="drop-chip" id="drop-chip"><i class="ti ti-check" style="font-size:12px" aria-hidden="true"></i><span id="chip-name"></span></div>
             </div>
-            <input type="file" id="fInput" accept=".pdf,.txt,.doc,.docx" style="display:none" onchange="onFile(this)">
+            <input type="file" id="fInput" accept=".pdf,.txt,.docx" style="display:none" onchange="onFile(this)">
           </div>
         </div>
       </div>
@@ -526,7 +526,7 @@ window.addEventListener("DOMContentLoaded", () => {
 })();
 
 /* TYPEWRITER */
-let resumeText='';
+let selectedResumeFile=null;
 const roles=['that PM role','that engineering job','that design position','that data role','that leadership role','that marketing job'];
 let ri=0,ci=0,del=false;
 const tw=document.getElementById('tw');
@@ -608,18 +608,32 @@ if(heroCta){
   heroCta.addEventListener('mouseleave',()=>{heroCta.style.transform='';});
 }
 
-function onFile(inp){
-  const f=inp.files[0];if(!f)return;
+function setResumeFile(f){
+  if(!f)return;
+  selectedResumeFile=f;
   const drop=document.getElementById('drop');
   drop.classList.add('ok');
   drop.querySelector('.drop-icon').className='ti ti-circle-check drop-icon';
   const chip=document.getElementById('drop-chip');
   document.getElementById('chip-name').textContent=f.name;
   chip.style.display='inline-flex';
-  const r=new FileReader();
-  r.onload=e=>{resumeText=e.target.result;};
-  r.readAsText(f);
 }
+
+function onFile(inp){
+  setResumeFile(inp.files[0]);
+}
+
+const dropZone=document.getElementById('drop');
+dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('ok');});
+dropZone.addEventListener('dragleave',()=>{if(!selectedResumeFile)dropZone.classList.remove('ok');});
+dropZone.addEventListener('drop',e=>{
+  e.preventDefault();
+  const file=e.dataTransfer.files[0];
+  if(file){
+    document.getElementById('fInput').files=e.dataTransfer.files;
+    setResumeFile(file);
+  }
+});
 
 function showErr(m){document.getElementById('err-msg').textContent=m;document.getElementById('err-row').style.display='block';}
 function hideErr(){document.getElementById('err-row').style.display='none';}
@@ -638,7 +652,7 @@ async function go(){
   hideErr();
   const jd=document.getElementById('jd').value.trim();
   if(!jd){showErr('Please paste a job description to continue.');return;}
-  if(!resumeText){showErr('Please upload your resume to continue.');return;}
+  if(!selectedResumeFile){showErr('Please upload your resume to continue.');return;}
   show('loading-view');
   const delays=[0,700,1500,3000,5000,7500];
   loadSteps.forEach((s,i)=>{
@@ -650,10 +664,12 @@ async function go(){
     },delays[i]);
   });
   try{
+    const formData=new FormData();
+    formData.append('job_description',jd);
+    formData.append('resume_file',selectedResumeFile);
     const res=await fetch('/api/analyze',{
       method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({job_description:jd,resume:resumeText})
+      body:formData
     });
     const d=await res.json();
     if(!res.ok)throw new Error(d.error||'The backend could not analyze this application.');
@@ -718,7 +734,7 @@ function copy(id){navigator.clipboard.writeText(document.getElementById(id).text
 function reset(){
   document.getElementById('jd').value='';
   document.getElementById('fInput').value='';
-  resumeText='';
+  selectedResumeFile=null;
   const drop=document.getElementById('drop');
   drop.classList.remove('ok');
   drop.querySelector('.drop-icon').className='ti ti-file-text drop-icon';

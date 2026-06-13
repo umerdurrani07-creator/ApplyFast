@@ -3,11 +3,19 @@ import os
 import re
 import urllib.error
 import urllib.request
+from email import policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_MAX_JD_CHARS = 12000
+DEFAULT_MAX_CONTEXT_CHARS = 18000
+DEFAULT_CHUNK_CHARS = 1800
+DEFAULT_CHUNK_OVERLAP = 250
+DEFAULT_MAX_CHUNKS = 8
 
 
 def load_env():
@@ -23,11 +31,128 @@ def load_env():
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def decode_text_file(file_bytes):
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def extract_pdf_text(file_bytes):
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ValueError("PDF support requires installing dependencies from requirements.txt.") from exc
+
+    reader = PdfReader(BytesIO(file_bytes))
+    text = "\n".join((page.extract_text() or "").strip() for page in reader.pages)
+    return text.strip()
+
+
+def extract_docx_text(file_bytes):
+    try:
+        from docx import Document
+    except ImportError as exc:
+        raise ValueError("DOCX support requires installing dependencies from requirements.txt.") from exc
+
+    document = Document(BytesIO(file_bytes))
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    return text.strip()
+
+
+def extract_resume_text(file_bytes, filename="", content_type=""):
+    name = (filename or "").lower()
+    kind = (content_type or "").lower()
+
+    if name.endswith(".pdf") or "pdf" in kind:
+        text = extract_pdf_text(file_bytes)
+    elif name.endswith(".docx") or "wordprocessingml.document" in kind:
+        text = extract_docx_text(file_bytes)
+    elif name.endswith(".txt") or kind.startswith("text/"):
+        text = decode_text_file(file_bytes).strip()
+    elif name.endswith(".doc"):
+        raise ValueError("Legacy .doc files are not supported. Please upload PDF, DOCX, or TXT.")
+    else:
+        text = decode_text_file(file_bytes).strip()
+
+    if not text:
+        raise ValueError("Could not extract text from the uploaded resume. Try a text-based PDF, DOCX, or TXT file.")
+    return text
+
+
+def parse_multipart_form(content_type, body):
+    headers = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+    message = BytesParser(policy=policy.default).parsebytes(headers + body)
+    fields = {}
+    files = {}
+
+    for part in message.iter_parts():
+        disposition = part.get("Content-Disposition", "")
+        if "form-data" not in disposition:
+            continue
+        name = part.get_param("name", header="content-disposition")
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        if filename:
+            files[name] = {
+                "filename": filename,
+                "content_type": part.get_content_type(),
+                "content": payload,
+            }
+        else:
+            fields[name] = decode_text_file(payload).strip()
+
+    return fields, files
+
+
+def get_analysis_inputs(headers, rfile):
+    content_type = headers.get("Content-Type", "")
+    length = int(headers.get("Content-Length", "0"))
+    body = rfile.read(length)
+
+    if content_type.startswith("multipart/form-data"):
+        fields, files = parse_multipart_form(content_type, body)
+        job_description = fields.get("job_description", "").strip()
+        uploaded = files.get("resume_file") or files.get("resume")
+        if not uploaded:
+            raise ValueError("Resume file is required.")
+        resume = extract_resume_text(uploaded["content"], uploaded["filename"], uploaded["content_type"])
+        return job_description, resume
+
+    payload = json.loads(body.decode("utf-8"))
+    return str(payload.get("job_description", "")).strip(), str(payload.get("resume", "")).strip()
+
+
 def clamp_score(value, default=0):
     try:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def env_int(name, default, minimum=None, maximum=None):
+    try:
+        value = int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def normalize_space(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def limit_text(text, max_chars):
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(" ", 1)[0].strip() + "\n\n[Truncated for token safety.]"
 
 
 def extract_keywords(text, limit):
@@ -44,6 +169,95 @@ def extract_keywords(text, limit):
         counts[word] = counts.get(word, 0) + 1
     ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     return [word.title() for word, _ in ranked[:limit]]
+
+
+def retrieval_terms(job_description):
+    terms = [term.lower() for term in extract_keywords(job_description, 80)]
+    phrases = re.findall(r"\b[A-Z][A-Za-z+#.-]*(?:\s+[A-Z][A-Za-z+#.-]*){1,3}\b", job_description or "")
+    for phrase in phrases:
+        phrase = phrase.lower()
+        if phrase not in terms and len(phrase) <= 60:
+            terms.append(phrase)
+    return terms
+
+
+def chunk_text(text, chunk_chars=None, overlap=None):
+    chunk_chars = chunk_chars or env_int("RAG_CHUNK_CHARS", DEFAULT_CHUNK_CHARS, 600, 5000)
+    overlap = overlap if overlap is not None else env_int("RAG_CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP, 0, 1000)
+    text = normalize_space(text)
+    if not text:
+        return []
+
+    chunks = []
+    start = 0
+    text_len = len(text)
+    while start < text_len:
+        end = min(start + chunk_chars, text_len)
+        if end < text_len:
+            soft_end = text.rfind(". ", start, end)
+            if soft_end > start + chunk_chars // 2:
+                end = soft_end + 1
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= text_len:
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
+def score_chunk(chunk, terms):
+    chunk_lc = chunk.lower()
+    score = 0
+    for term in terms:
+        if not term:
+            continue
+        hits = chunk_lc.count(term)
+        if hits:
+            score += hits * (4 if " " in term else 1)
+
+    # Resume sections with durable signal should survive even if wording differs from the JD.
+    for section in ("experience", "projects", "skills", "education", "certifications", "summary"):
+        if section in chunk_lc:
+            score += 2
+    return score
+
+
+def retrieve_resume_context(job_description, resume_text):
+    max_context_chars = env_int("RAG_MAX_CONTEXT_CHARS", DEFAULT_MAX_CONTEXT_CHARS, 6000, 60000)
+    max_chunks = env_int("RAG_MAX_CHUNKS", DEFAULT_MAX_CHUNKS, 3, 20)
+    chunks = chunk_text(resume_text)
+    if not chunks:
+        raise ValueError("Could not prepare resume text for analysis.")
+
+    terms = retrieval_terms(job_description)
+    ranked = sorted(
+        enumerate(chunks),
+        key=lambda item: (score_chunk(item[1], terms), -item[0]),
+        reverse=True,
+    )
+
+    selected = sorted(ranked[:max_chunks], key=lambda item: item[0])
+    context_parts = []
+    used = 0
+    for index, chunk in selected:
+        header = f"[Resume excerpt {index + 1}/{len(chunks)}]\n"
+        remaining = max_context_chars - used - len(header)
+        if remaining <= 0:
+            break
+        safe_chunk = limit_text(chunk, remaining)
+        context_parts.append(header + safe_chunk)
+        used += len(header) + len(safe_chunk)
+
+    if not context_parts:
+        context_parts.append(limit_text(chunks[0], max_context_chars))
+
+    return "\n\n".join(context_parts), {
+        "resume_chars": len(resume_text),
+        "chunk_count": len(chunks),
+        "selected_chunks": len(context_parts),
+        "context_chars": sum(len(part) for part in context_parts),
+    }
 
 
 def mock_analysis(job_description, resume):
@@ -98,14 +312,22 @@ def mock_analysis(job_description, resume):
     }
 
 
-def build_prompt(job_description, resume):
+def build_prompt(job_description, resume_context, retrieval_meta):
     return f"""You are an expert career coach. Given a job description and resume, respond ONLY with a valid JSON object. Do not include markdown fences or a preamble.
 
 JOB DESCRIPTION:
 {job_description}
 
-RESUME:
-{resume}
+RESUME CONTEXT:
+The resume may have been shortened with retrieval to control token usage. Use only the supplied excerpts. Do not invent missing employment history, dates, tools, employers, degrees, or certifications.
+
+Retrieval metadata:
+- Original resume characters: {retrieval_meta["resume_chars"]}
+- Resume chunks created: {retrieval_meta["chunk_count"]}
+- Chunks supplied: {retrieval_meta["selected_chunks"]}
+- Supplied context characters: {retrieval_meta["context_chars"]}
+
+{resume_context}
 
 JSON schema:
 {{
@@ -131,15 +353,19 @@ def parse_model_json(raw_text):
 
 
 def analyze_with_anthropic(job_description, resume):
+    job_description = limit_text(job_description, env_int("MAX_JOB_DESCRIPTION_CHARS", DEFAULT_MAX_JD_CHARS, 2000, 50000))
+    resume_context, retrieval_meta = retrieve_resume_context(job_description, resume)
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key or os.getenv("MOCK_AI", "").lower() in {"1", "true", "yes"}:
-        return mock_analysis(job_description, resume)
+        result = mock_analysis(job_description, resume_context)
+        result["_retrieval"] = retrieval_meta
+        return result
 
     model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
     payload = {
         "model": model,
         "max_tokens": 3000,
-        "messages": [{"role": "user", "content": build_prompt(job_description, resume)}],
+        "messages": [{"role": "user", "content": build_prompt(job_description, resume_context, retrieval_meta)}],
     }
     request = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -189,10 +415,7 @@ class ApplyFastHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            job_description = str(payload.get("job_description", "")).strip()
-            resume = str(payload.get("resume", "")).strip()
+            job_description, resume = get_analysis_inputs(self.headers, self.rfile)
 
             if not job_description:
                 self.send_json(400, {"error": "Job description is required."})

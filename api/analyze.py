@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend import analyze_with_anthropic  # noqa: E402
+from backend import analyze_with_anthropic, get_analysis_inputs  # noqa: E402
 
 
 class handler(BaseHTTPRequestHandler):
@@ -31,10 +31,7 @@ class handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            job_description = str(payload.get("job_description", "")).strip()
-            resume = str(payload.get("resume", "")).strip()
+            job_description, resume = get_analysis_inputs(self.headers, self.rfile)
 
             if not job_description:
                 self.send_json(400, {"error": "Job description is required."})
