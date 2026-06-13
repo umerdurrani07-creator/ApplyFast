@@ -352,28 +352,36 @@ def parse_model_json(raw_text):
     return json.loads(cleaned)
 
 
-def analyze_with_anthropic(job_description, resume):
+def env_flag(name):
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def analyze_with_openrouter(job_description, resume):
     job_description = limit_text(job_description, env_int("MAX_JOB_DESCRIPTION_CHARS", DEFAULT_MAX_JD_CHARS, 2000, 50000))
     resume_context, retrieval_meta = retrieve_resume_context(job_description, resume)
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key or os.getenv("MOCK_AI", "").lower() in {"1", "true", "yes"}:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if env_flag("MOCK_AI"):
         result = mock_analysis(job_description, resume_context)
         result["_retrieval"] = retrieval_meta
         return result
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY is not configured. Add it to your Vercel Environment Variables and redeploy.")
 
-    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+    model = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
     payload = {
         "model": model,
-        "max_tokens": 3000,
+        "max_tokens": env_int("OPENROUTER_MAX_TOKENS", 3000, 1000, 8000),
         "messages": [{"role": "user", "content": build_prompt(job_description, resume_context, retrieval_meta)}],
+        "reasoning": {"enabled": True},
     }
     request = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
+        "https://openrouter.ai/api/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
         headers={
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:8000"),
+            "X-Title": os.getenv("OPENROUTER_APP_NAME", "ApplyFast"),
         },
         method="POST",
     )
@@ -381,8 +389,20 @@ def analyze_with_anthropic(job_description, resume):
     with urllib.request.urlopen(request, timeout=90) as response:
         data = json.loads(response.read().decode("utf-8"))
 
-    raw = "".join(block.get("text", "") for block in data.get("content", []))
-    return parse_model_json(raw)
+    message = data.get("choices", [{}])[0].get("message", {})
+    raw = message.get("content") or ""
+    result = parse_model_json(raw)
+    result["_retrieval"] = retrieval_meta
+    return result
+
+
+def openrouter_health():
+    return {
+        "ok": True,
+        "openrouter_key_configured": bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
+        "mock_ai": env_flag("MOCK_AI"),
+        "model": os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free"),
+    }
 
 
 class ApplyFastHandler(BaseHTTPRequestHandler):
@@ -398,6 +418,10 @@ class ApplyFastHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/api/analyze":
+            self.send_json(200, openrouter_health())
+            return
+
         if self.path not in {"/", "/index.html"}:
             self.send_error(404, "Not found")
             return
@@ -424,10 +448,10 @@ class ApplyFastHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Resume text is required."})
                 return
 
-            self.send_json(200, analyze_with_anthropic(job_description, resume))
+            self.send_json(200, analyze_with_openrouter(job_description, resume))
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
-            self.send_json(exc.code, {"error": f"Anthropic API error: {details}"})
+            self.send_json(exc.code, {"error": f"OpenRouter API error: {details}"})
         except (json.JSONDecodeError, ValueError) as exc:
             self.send_json(400, {"error": f"Invalid request or AI response: {exc}"})
         except Exception as exc:

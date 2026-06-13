@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend import analyze_with_anthropic, get_analysis_inputs  # noqa: E402
+from backend import analyze_with_openrouter, get_analysis_inputs, openrouter_health  # noqa: E402
 
 
 class handler(BaseHTTPRequestHandler):
@@ -29,6 +29,9 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def do_GET(self):
+        self.send_json(200, openrouter_health())
+
     def do_POST(self):
         try:
             job_description, resume = get_analysis_inputs(self.headers, self.rfile)
@@ -40,10 +43,10 @@ class handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Resume text is required."})
                 return
 
-            self.send_json(200, analyze_with_anthropic(job_description, resume))
+            self.send_json(200, analyze_with_openrouter(job_description, resume))
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
-            self.send_json(exc.code, {"error": f"Anthropic API error: {details}"})
+            self.send_json(exc.code, {"error": f"OpenRouter API error: {details}"})
         except (json.JSONDecodeError, ValueError) as exc:
             self.send_json(400, {"error": f"Invalid request or AI response: {exc}"})
         except Exception as exc:
